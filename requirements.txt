@@ -1,0 +1,4 @@
+pyTelegramBotAPI
+gradio_client
+flask
+gunicorn
