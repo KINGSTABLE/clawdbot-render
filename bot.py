@@ -9,7 +9,7 @@ from gradio_client import Client, handle_file
 # CONFIGURATION
 # ==========================================
 
-# 1. Get the Telegram Token from Environment Variables (set this in Render)
+# 1. Get the Telegram Token from Environment Variables
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 # 2. Your Gradio API URL
@@ -21,20 +21,29 @@ app = Flask(__name__)
 # Initialize Bot
 if not BOT_TOKEN:
     print("Error: TELEGRAM_BOT_TOKEN not found in environment variables.")
-    # We allow the script to run so Render doesn't crash immediately, 
-    # but the bot won't work without the token.
 else:
     bot = telebot.TeleBot(BOT_TOKEN)
 
-# Initialize Gradio Client
-try:
-    print("Initializing Gradio Client...")
-    gradio_client = Client(GRADIO_API_URL)
-    print("Gradio Client Connected.")
-except Exception as e:
-    print(f"Error connecting to Gradio API: {e}")
+# Global Client Variable
+gradio_client = None
 
-# In-memory storage for user history (Note: This resets if the Render dyno restarts)
+def connect_to_gradio():
+    """Attempts to connect/reconnect to the Gradio backend."""
+    global gradio_client
+    try:
+        print("Attempting to connect to Gradio API...")
+        gradio_client = Client(GRADIO_API_URL)
+        print("✅ Gradio Client Connected successfully.")
+        return True
+    except Exception as e:
+        print(f"⚠️ Error connecting to Gradio API: {e}")
+        gradio_client = None
+        return False
+
+# Initial connection attempt
+connect_to_gradio()
+
+# In-memory storage for user history
 user_sessions = {}
 
 # ==========================================
@@ -101,13 +110,20 @@ if BOT_TOKEN:
         # clear local session
         user_sessions[user_id] = {"history": [], "pending_proposals": []}
         
+        # Check connection before calling API
+        global gradio_client
+        if gradio_client is None:
+            if not connect_to_gradio():
+                 bot.reply_to(message, "⚠️ Backend unavailable. Local history cleared, but could not reset server state.")
+                 return
+
         # Call API to clear proposals
         try:
             gradio_client.predict(api_name="/clear_all_proposals")
-        except:
-            pass
+            bot.reply_to(message, "Conversation history and pending proposals cleared.")
+        except Exception as e:
+            bot.reply_to(message, f"Local history cleared. Server error: {str(e)}")
             
-        bot.reply_to(message, "Conversation history and pending proposals cleared.")
 
     @bot.message_handler(commands=['approve'])
     def approve_proposals(message):
@@ -118,19 +134,25 @@ if BOT_TOKEN:
             bot.reply_to(message, "No pending proposals to approve.")
             return
 
+        # Ensure connection
+        global gradio_client
+        if gradio_client is None:
+            bot.reply_to(message, "⚠️ Connection lost. Reconnecting...")
+            if not connect_to_gradio():
+                bot.reply_to(message, "❌ Could not connect to the backend server. Please try again later.")
+                return
+
         bot.reply_to(message, "⏳ Executing approved proposals...")
 
         try:
             # Call /execute_approved_proposals
-            # The API expects selected_ids (list) and history
             result = gradio_client.predict(
-                selected_ids=session['pending_proposals'], # We approve all pending
+                selected_ids=session['pending_proposals'],
                 history=session['history'],
                 api_name="/execute_approved_proposals"
             )
             
             # Update history with the result
-            # Result tuple: [0] str (val_27), [1] list (pending), [2] history
             new_history = result[2]
             session['history'] = new_history
             session['pending_proposals'] = result[1] # Should be empty now
@@ -148,24 +170,32 @@ if BOT_TOKEN:
         user_input = message.text
         session = get_session(user_id)
 
+        # Ensure connection
+        global gradio_client
+        if gradio_client is None:
+            status_msg = bot.reply_to(message, "⚠️ Connecting to backend...")
+            if not connect_to_gradio():
+                bot.edit_message_text("❌ Error: Could not connect to the backend server. It might be sleeping.", message.chat.id, status_msg.message_id)
+                return
+            # Delete connecting message
+            try:
+                bot.delete_message(message.chat.id, status_msg.message_id)
+            except:
+                pass
+
         # Notify user we are processing
         status_msg = bot.reply_to(message, "Thinking...")
 
         try:
             # 1. Call /agent_loop
-            # Parameters: message (str), history (list), uploaded_file (list)
             result = gradio_client.predict(
                 message=user_input,
                 history=session['history'],
-                uploaded_file=[], # Required parameter, passing empty list
+                uploaded_file=[], 
                 api_name="/agent_loop"
             )
 
             # 2. Parse Results
-            # [0] history (list of dicts)
-            # [1] value_18 (textbox - usually empty after send)
-            # [2] Pending Proposals (list)
-            
             new_history = result[0]
             pending_proposals = result[2]
 
@@ -176,11 +206,11 @@ if BOT_TOKEN:
             # 3. Send Reply to Telegram
             response_text = format_gradio_response(new_history)
             
-            # Delete the "Thinking..." message and send the actual response
+            # Delete the "Thinking..." message
             try:
                 bot.delete_message(message.chat.id, status_msg.message_id)
             except:
-                pass # If delete fails, just send the new one
+                pass 
             
             bot.reply_to(message, response_text)
 
@@ -194,7 +224,14 @@ if BOT_TOKEN:
                 )
 
         except Exception as e:
-            bot.edit_message_text(f"❌ Error: {str(e)}", message.chat.id, status_msg.message_id)
+            # If the specific error is related to connection, mark client as None
+            if "Connection" in str(e) or "404" in str(e):
+                 gradio_client = None
+            
+            try:
+                bot.edit_message_text(f"❌ Error: {str(e)}", message.chat.id, status_msg.message_id)
+            except:
+                bot.reply_to(message, f"❌ Error: {str(e)}")
 
 # ==========================================
 # FLASK SERVER (FOR RENDER KEEPALIVE)
@@ -202,7 +239,8 @@ if BOT_TOKEN:
 
 @app.route('/')
 def index():
-    return "Bot is running!", 200
+    status = "Connected" if gradio_client else "Disconnected"
+    return f"Bot is running! Backend Status: {status}", 200
 
 def run_flask():
     # Render assigns the PORT environment variable
@@ -221,5 +259,5 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
     
-    # Start the Bot in the main thread (or separate, but here we separate Flask)
+    # Start the Bot in the main thread
     run_bot()
