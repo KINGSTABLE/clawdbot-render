@@ -12,7 +12,11 @@ from gradio_client import Client, handle_file
 # 1. Get the Telegram Token from Environment Variables
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# 2. Your Gradio API URL
+# 2. Get the Hugging Face Token (New!)
+# Set this in Render Environment Variables as HF_TOKEN
+HF_TOKEN = os.environ.get("HF_TOKEN") 
+
+# 3. Your Gradio API URL
 GRADIO_API_URL = "https://executor-tyrant-framework-clawdbot-dev.hf.space/"
 
 # Initialize Flask (Required for Render to keep the app alive)
@@ -24,7 +28,10 @@ if not BOT_TOKEN:
 else:
     bot = telebot.TeleBot(BOT_TOKEN)
 
-# Global Client Variable
+# ==========================================
+# GLOBAL CLIENT INITIALIZATION
+# ==========================================
+# We define this globally so it always exists, even if connection fails initially.
 gradio_client = None
 
 def connect_to_gradio():
@@ -32,7 +39,14 @@ def connect_to_gradio():
     global gradio_client
     try:
         print("Attempting to connect to Gradio API...")
-        gradio_client = Client(GRADIO_API_URL)
+        
+        # If you have an HF_TOKEN, we pass it here.
+        if HF_TOKEN:
+            print("Using HF_TOKEN for authentication.")
+            gradio_client = Client(GRADIO_API_URL, hf_token=HF_TOKEN)
+        else:
+            gradio_client = Client(GRADIO_API_URL)
+            
         print("✅ Gradio Client Connected successfully.")
         return True
     except Exception as e:
@@ -175,7 +189,7 @@ if BOT_TOKEN:
         if gradio_client is None:
             status_msg = bot.reply_to(message, "⚠️ Connecting to backend...")
             if not connect_to_gradio():
-                bot.edit_message_text("❌ Error: Could not connect to the backend server. It might be sleeping.", message.chat.id, status_msg.message_id)
+                bot.edit_message_text("❌ Error: Could not connect to the backend server. Check your HF_TOKEN.", message.chat.id, status_msg.message_id)
                 return
             # Delete connecting message
             try:
@@ -225,7 +239,7 @@ if BOT_TOKEN:
 
         except Exception as e:
             # If the specific error is related to connection, mark client as None
-            if "Connection" in str(e) or "404" in str(e):
+            if "Connection" in str(e) or "404" in str(e) or "401" in str(e):
                  gradio_client = None
             
             try:
